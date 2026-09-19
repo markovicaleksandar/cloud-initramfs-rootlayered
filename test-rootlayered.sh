@@ -5,11 +5,15 @@
 #  Downloads the maas.io noble ephemeral kernel/initrd, resolves a
 #  comma-separated list of squashfs layers (maas/cloud/local files),
 #  builds a small "upper" squashfs layer (NoCloud seed for password
-#  login), stacks rootlayered into the base initrd, serves everything
-#  over http, and boots the result in QEMU.
+#  login), stacks rootlayered into the base initrd via mkcpio.sh, and
+#  boots the result in QEMU.
+#
+#  Two delivery schemes:
+#    --scheme http  layers are served over http and fetched at boot
+#    --scheme file  layers are baked into the initrd and used in place
 #
 #  Must be run from the project root (expects ./local-top/rootlayered
-#  to exist).
+#  and ./mkcpio.sh to exist).
 
 set -euo pipefail
 
@@ -25,6 +29,7 @@ HTTPD_ROOT="${WORK_DIR}/httpd-root"
 HTTPD_LOG="${WORK_DIR}/httpd.log"
 INTERACTIVE=false
 SOURCE="cloud"  # comma-separated layer list: maas, cloud, and/or /path/to/*.squashfs
+SCHEME="http"   # http (serve and fetch) or file (bake into the initrd)
 RESOLVED_LAYERS=()
 
 HTTPD_PID=""
@@ -42,10 +47,13 @@ check_deps() {
 		echo "ERROR: missing required tools: ${missing[*]}" >&2
 		return 1
 	fi
-	[[ -f "local-top/rootlayered" ]] || {
-		echo "ERROR: local-top/rootlayered not found (run from project root)" >&2
-		return 1
-	}
+	local f
+	for f in local-top/rootlayered mkcpio.sh; do
+		[[ -f "$f" ]] || {
+			echo "ERROR: $f not found (run from project root)" >&2
+			return 1
+		}
+	done
 }
 
 # Find the latest dated snapshot directory under stable/<series>/<arch>/
@@ -159,6 +167,19 @@ resolve_sources() {
 	done
 }
 
+# Give every layer a unique, predictable basename. Both schemes need
+# this: http serves them by name, file bakes them in by basename.
+# Hardlink where possible so large images are not copied.
+stage_layers() {
+	local i src dst
+	for i in "${!RESOLVED_LAYERS[@]}"; do
+		src="${RESOLVED_LAYERS[$i]}"
+		dst="${WORK_DIR}/layer${i}.squashfs"
+		rm -f "$dst"
+		ln "$src" "$dst" 2>/dev/null || cp "$src" "$dst"
+	done
+}
+
 build_upper_squashfs() {
 	[[ -f "${WORK_DIR}/upper.squashfs" ]] && {
 		info "upper.squashfs already built, skipping"
@@ -197,7 +218,7 @@ setup_httpd_root() {
 
 	local i
 	for i in "${!RESOLVED_LAYERS[@]}"; do
-		ln -sf "${RESOLVED_LAYERS[$i]}" "${HTTPD_ROOT}/layer${i}.squashfs"
+		ln -sf "${WORK_DIR}/layer${i}.squashfs" "${HTTPD_ROOT}/layer${i}.squashfs"
 	done
 }
 
@@ -212,40 +233,44 @@ stop_httpd() {
 	[[ -n "$HTTPD_PID" ]] && kill "$HTTPD_PID" 2>/dev/null || true
 }
 
+# Upper layer first, then the lowers in the order given.
+build_root_param() {
+	local parts=() i prefix
+
+	if [[ "$SCHEME" == "file" ]]; then
+		prefix="file://"
+	else
+		prefix="http://10.0.2.2:${HTTP_PORT}"
+	fi
+
+	parts+=("${prefix}/upper.squashfs")
+	for i in "${!RESOLVED_LAYERS[@]}"; do
+		parts+=("${prefix}/layer${i}.squashfs")
+	done
+
+	local IFS=','
+	echo "overlayfs:${parts[*]}"
+}
+
 build_combined_initrd() {
-	local extra="${WORK_DIR}/extra"
-	rm -rf "$extra"
-	mkdir -p "$extra/scripts/local-top"
+	local args=() i
 
-	cp "local-top/rootlayered" "$extra/scripts/local-top/rootlayered"
-	chmod +x "$extra/scripts/local-top/rootlayered"
+	if [[ "$SCHEME" == "file" ]]; then
+		args+=(--include "${WORK_DIR}/upper.squashfs")
+		for i in "${!RESOLVED_LAYERS[@]}"; do
+			args+=(--include "${WORK_DIR}/layer${i}.squashfs")
+		done
+		info "Baking ${#RESOLVED_LAYERS[@]} layer(s) + upper into the initrd"
+	fi
 
-	cat > "$extra/scripts/local-top/ORDER" <<'EOF'
-/scripts/local-top/cryptopensc "$@"
-[ -e /conf/param.conf ] && . /conf/param.conf
-/scripts/local-top/iscsi "$@"
-[ -e /conf/param.conf ] && . /conf/param.conf
-/scripts/local-top/rootlayered "$@"
-[ -e /conf/param.conf ] && . /conf/param.conf
-/scripts/local-top/rooturl "$@"
-[ -e /conf/param.conf ] && . /conf/param.conf
-/scripts/local-top/cryptroot "$@"
-[ -e /conf/param.conf ] && . /conf/param.conf
-EOF
-
-	info "Building extra cpio"
-	(cd "$extra" && find . | cpio -o -H newc | gzip > "${WORK_DIR}/rootlayered.cpio.gz")
-
-	info "Concatenating with maas boot-initrd"
-	cat "${MAAS_DIR}/boot-initrd" "${WORK_DIR}/rootlayered.cpio.gz" > "${WORK_DIR}/combined-initrd.img"
+	info "Building combined initrd via mkcpio.sh"
+	./mkcpio.sh "${args[@]}" "${MAAS_DIR}/boot-initrd" \
+		> "${WORK_DIR}/combined-initrd.img"
 }
 
 run_qemu() {
-	local layer_urls="" i
-	for i in "${!RESOLVED_LAYERS[@]}"; do
-		layer_urls="${layer_urls},http://10.0.2.2:${HTTP_PORT}/layer${i}.squashfs"
-	done
-	local root_param="overlayfs:http://10.0.2.2:${HTTP_PORT}/upper.squashfs${layer_urls}"
+	local root_param
+	root_param=$(build_root_param)
 
 	local extra_cmdline=""
 	$INTERACTIVE && extra_cmdline=" break=top"
@@ -254,6 +279,10 @@ run_qemu() {
 	$INTERACTIVE && info "Interactive: will break to a shell before local-top runs"
 	info "Ctrl-A X to quit QEMU when done"
 
+	# 'ro' is required alongside overlayroot=tmpfs: without it,
+	# overlayroot mangles its own mount options and leaves stray
+	# '-o' and 'lowerdir=' directories in the merged root.
+	#
 	# QEMU's -netdev user always hands out 10.0.2.15/24 via gateway
 	# 10.0.2.2, so we skip dhcpcd (and its slow ARP duplicate-address
 	# probe) entirely with a static ip= kernel param. Interface name
@@ -262,6 +291,9 @@ run_qemu() {
 	# "first available device" which is fragile once more than one
 	# NIC is present, e.g. in production. Verify with `ip a` if the
 	# device model, PCI topology, or ordering changes.
+	#
+	# With --scheme file rootlayered never brings the network up, but
+	# the real root still wants it for cloud-init, so this stays.
 	local net_ifname="ens3"
 	local static_ip="ip=10.0.2.15::10.0.2.2:255.255.255.0::${net_ifname}:off"
 
@@ -273,13 +305,13 @@ run_qemu() {
 		-netdev user,id=net0 -device virtio-net-pci,netdev=net0 \
 		-kernel "${MAAS_DIR}/boot-kernel" \
 		-initrd "${WORK_DIR}/combined-initrd.img" \
-		-append "root=${root_param} console=ttyS0 overlayroot=tmpfs ${static_ip}${extra_cmdline}" \
+		-append "root=${root_param} console=ttyS0 ro overlayroot=tmpfs ${static_ip}${extra_cmdline}" \
 		-nographic
 }
 
 usage() {
 	cat <<EOF
-Usage: ${0##*/} [-i|--interactive] [--source LAYERS]
+Usage: ${0##*/} [-i|--interactive] [--source LAYERS] [--scheme http|file]
 
   -i, --interactive     Break to a debug shell (break=top) before
                          local-top scripts run, so you can manually
@@ -292,6 +324,10 @@ Usage: ${0##*/} [-i|--interactive] [--source LAYERS]
                            cloud   - Ubuntu server cloud image squashfs
                            /path/to/foo.squashfs - your own squashfs
                          Example: --source maas,/tmp/mine.squashfs
+  --scheme http|file     How layers reach the initramfs (default: http).
+                           http - served locally, fetched at boot
+                           file - baked into the initrd, no http server
+                                  and no network setup in rootlayered
 EOF
 }
 
@@ -300,6 +336,14 @@ parse_args() {
 		case "$1" in
 			-i|--interactive) INTERACTIVE=true; shift ;;
 			--source) SOURCE="$2"; shift 2 ;;
+			--scheme)
+				SCHEME="$2"
+				[[ "$SCHEME" == "http" || "$SCHEME" == "file" ]] || {
+					echo "ERROR: --scheme must be 'http' or 'file'" >&2
+					exit 1
+				}
+				shift 2
+				;;
 			-h|--help) usage; exit 0 ;;
 			*) echo "ERROR: unknown option: $1" >&2; usage >&2; exit 1 ;;
 		esac
@@ -310,14 +354,18 @@ main() {
 	parse_args "$@"
 	check_deps || exit 1
 	mkdir -p "${WORK_DIR}"
-	info "Squashfs source: ${SOURCE}"
+	info "Squashfs source: ${SOURCE}  (scheme: ${SCHEME})"
 
 	download_maas_kernel_initrd || exit 1
 	resolve_sources || exit 1
+	stage_layers || exit 1
 	build_upper_squashfs || exit 1
-	setup_httpd_root
-	start_httpd
-	trap stop_httpd EXIT
+
+	if [[ "$SCHEME" == "http" ]]; then
+		setup_httpd_root
+		start_httpd
+		trap stop_httpd EXIT
+	fi
 
 	build_combined_initrd || exit 1
 	run_qemu

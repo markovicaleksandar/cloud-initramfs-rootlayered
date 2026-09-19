@@ -72,7 +72,7 @@ process_overlayfs_layers() {
 	
 	# Write config for initramfs
 	{
-		echo 'ROOTFSTYPE="overlayfs"'
+		echo 'ROOTFSTYPE="rootlayered"'
 		echo 'ROOTFLAGS="-o move"'
 		echo "ROOT=\"$merged_dir\""
 	} > /conf/param.conf
