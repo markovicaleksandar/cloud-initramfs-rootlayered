@@ -1,0 +1,133 @@
+#!/bin/sh
+#  Copyright, 2024 Aleksandar Markovic
+#  
+#  Inspired by cloud-initramfs-rooturl, with extensions to support overlayfs-based
+#  layered root filesystems
+#
+#  This program is free software: you can redistribute it and/or modify
+#  it under the terms of the GNU General Public License as published by
+#  the Free Software Foundation, either version 3 of the License, or
+#  (at your option) any later version.
+#
+#  This program is distributed in the hope that it will be useful,
+#  but WITHOUT ANY WARRANTY; without even the implied warranty of
+#  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+#  GNU General Public License for more details.
+#
+#    You should have received a copy of the GNU General Public License
+#    along with this program.  If not, see
+#    <http://www.gnu.org/licenses/>.
+
+PREREQS=""
+case $1 in
+	prereqs) echo "${PREREQS}"; exit 0;;
+esac
+
+process_overlayfs_layers() {
+	local layers_spec="$1"
+	local layer_index=0
+	local merged_dir="${rootmnt}.merged"
+	local lower_dirs=""
+	local oifs="$IFS"
+	
+	IFS=","
+	set -- $layers_spec
+	IFS="$oifs"
+	
+	for layer_entry in "$@"; do
+		local target="" url="" helper="" image=""
+		
+		# All layers are lowers
+		target="${rootmnt}.lower${layer_index}"
+		lower_dirs="${lower_dirs}${lower_dirs:+:}${target}"
+		
+		# Determine helper and URL from extension
+		case "$layer_entry" in
+			http://*squashfs|file://*squashfs)
+				helper="mount_squash"
+				url="$layer_entry"
+				;;
+			*)
+				log_warning_msg "cannot determine helper for layer: $layer_entry"
+				return 1
+				;;
+		esac
+		
+		mkdir -p "$target" || return 1
+		image=$(fetch_layer "$url" "$target.img") || return 1
+		"$helper" "$image" "$target" || return 1
+		
+		layer_index=$((layer_index + 1))
+	done
+	
+	if [ "$layer_index" -eq 1 ]; then
+		# Single layer: overlayfs requires >= 2 lowerdirs when there is
+		# no upperdir, so just use the sole layer directly as root.
+		merged_dir="${rootmnt}.lower0"
+	else
+		# Create merged directory and mount overlay with only lowerdirs
+		mkdir -p "$merged_dir" || return 1
+		mount -t overlay overlay -o "lowerdir=${lower_dirs}" "$merged_dir" || return 1
+	fi
+	
+	# Write config for initramfs
+	{
+		echo 'ROOTFSTYPE="overlayfs"'
+		echo 'ROOTFLAGS="-o move"'
+		echo "ROOT=\"$merged_dir\""
+	} > /conf/param.conf
+}
+
+# Resolve a layer URL to a local image path.
+# http:// is downloaded to $dest.
+fetch_layer() {
+	local url="$1" dest="$2" path=""
+	case "$url" in
+		file://*)
+			path="${url#file://}"
+			[ -f "$path" ] || {
+				log_warning_msg "layer file not found: $path"
+				return 1
+			}
+			echo "$path"
+			;;
+		*)
+			wget "$url" -O "$dest" || return 1
+			echo "$dest"
+			;;
+	esac
+}
+
+mount_squash() {
+	local image="$1" target="$2"
+	mount -t squashfs -o loop ${ROOTFLAGS} "$image" "$target" || return 1
+}
+
+. /scripts/functions
+
+case "$ROOT" in
+	overlayfs:*) :;;
+	*) exit 0
+esac
+
+# Defensive: cloud-initramfs-rooturl matches any ROOT containing ':http://'
+# which our overlayfs: prefix also contains, causing it to misfire on our
+# ROOT value too. The .deb declares Conflicts/Replaces against it, but that
+# only helps when installed via dpkg. Remove it here as well to guard
+# against manually-stacked initramfs/cpio setups where no package manager
+# is involved.
+rm -f /scripts/local-top/rooturl 2>/dev/null || true
+
+# Strip 'overlayfs:' prefix and process layers
+layers_spec="${ROOT#overlayfs:}"
+
+# Only bring up the network if at least one layer is fetched over it;
+# an all-file:// spec boots without waiting on DHCP.
+case "$layers_spec" in
+	*http://*) configure_networking || exit;;
+esac
+
+process_overlayfs_layers "$layers_spec" || exit 1
+
+
+# vi: ts=4 noexpandtab
